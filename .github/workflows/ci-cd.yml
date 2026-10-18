@@ -1,0 +1,223 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push to the same branch (or PR) cancels any run still in progress for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  LOCAL_IMAGE: telemetry-api:ci
+
+jobs:
+  # Static checks: ruff lint rules and formatting. Cheapest job, so it runs first.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+  # Unit tests on every supported Python version, with JUnit XML reports uploaded as artifacts.
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run pytest
+        run: pytest -v --junitxml=test-results/junit-${{ matrix.python-version }}.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-py${{ matrix.python-version }}
+          path: test-results/
+          if-no-files-found: error
+
+  # Build the Docker image (cached through the GitHub Actions cache), then run it and
+  # smoke-test the real container over HTTP.
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: ${{ env.LOCAL_IMAGE }}
+          build-args: APP_VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start container
+        run: docker run -d --name smoke -p 8000:8000 "$LOCAL_IMAGE"
+
+      - name: Wait for /health (up to 30 s)
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/health; then
+              echo
+              echo "Healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Container did not become healthy within 30 s"
+          docker logs smoke
+          exit 1
+
+      - name: Check version, POST and GET telemetry
+        run: |
+          set -euo pipefail
+
+          version=$(curl -fsS http://localhost:8000/health | jq -r .version)
+          test "$version" = "$GITHUB_SHA" || { echo "::error::version '$version' != '$GITHUB_SHA'"; exit 1; }
+
+          status=$(curl -sS -o post.json -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json' \
+            -d '{"battery": 76.5, "x": 1.5, "y": -2.0, "state": "moving"}' \
+            http://localhost:8000/robots/smoke-bot/telemetry)
+          cat post.json; echo
+          test "$status" = "201" || { echo "::error::POST returned $status, expected 201"; exit 1; }
+
+          curl -fsS http://localhost:8000/robots/smoke-bot | tee get.json; echo
+          jq -e '.robot_id == "smoke-bot" and .battery == 76.5 and .state == "moving"' get.json
+
+          curl -fsS http://localhost:8000/robots | jq -e 'map(.robot_id) | index("smoke-bot") != null'
+
+      - name: Show container logs
+        if: failure()
+        run: docker logs smoke || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f smoke || true
+
+  # Push the image to GitHub Container Registry, tagged `latest` and `sha-<short sha>`.
+  # Only on pushes to main, so PRs never publish.
+  publish:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # metadata-action lowercases the image name, which GHCR requires.
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: APP_VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Tell Render to pull the new `latest` image, then wait until production reports
+  # this commit's SHA. Skips with a notice if the deploy hook secret isn't configured.
+  deploy:
+    needs: publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.PROD_URL }}
+    env:
+      RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+      PROD_URL: ${{ vars.PROD_URL }}
+    steps:
+      - name: Trigger Render deploy
+        id: trigger
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "::notice::RENDER_DEPLOY_HOOK_URL is not set; skipping deploy."
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          curl -fsS -X POST "$RENDER_DEPLOY_HOOK_URL" > /dev/null
+          echo "Deploy triggered."
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for production to serve this commit (up to 5 min)
+        if: steps.trigger.outputs.skipped == 'false'
+        run: |
+          if [ -z "$PROD_URL" ]; then
+            echo "::notice::PROD_URL variable is not set; skipping verification."
+            exit 0
+          fi
+          deadline=$(( $(date +%s) + 300 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            version=$(curl -fsS --max-time 10 "$PROD_URL/health" | jq -r .version 2>/dev/null || true)
+            echo "$(date -u +%T) production version: ${version:-<unreachable>}"
+            if [ "$version" = "$GITHUB_SHA" ]; then
+              echo "::notice::Production is running $GITHUB_SHA"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Production did not report version $GITHUB_SHA within 5 minutes"
+          exit 1
