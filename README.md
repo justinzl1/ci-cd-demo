@@ -1,7 +1,7 @@
 # Robot Telemetry API: CI/CD demo
 
 <!-- Replace <user> with your GitHub username or org. -->
-[![CI/CD](https://github.com/<user>/ci-cd-telemetry-demo/actions/workflows/ci-cd.yml/badge.svg?branch=main)](https://github.com/<user>/ci-cd-telemetry-demo/actions/workflows/ci-cd.yml)
+[![CI/CD](https://github.com/<user>/ci-cd-telemetry-demo/actions/workflows/ci-cd.yml/badge.svg?branch=main)](https://github.com/justinzl1/ci-cd-demo/actions/workflows/ci-cd.yml)
 
 A small FastAPI service that stores the latest status reported by each robot. The app is
 kept simple on purpose. The point of the repo is the pipeline: lint, test, build a Docker
