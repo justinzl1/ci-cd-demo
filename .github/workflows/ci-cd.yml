@@ -2,9 +2,9 @@ name: CI/CD
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
   workflow_dispatch:
 
 # A new push to the same branch (or PR) cancels any run still in progress for it.
@@ -136,10 +136,10 @@ jobs:
         run: docker rm -f smoke || true
 
   # Push the image to GitHub Container Registry, tagged `latest` and `sha-<short sha>`.
-  # Only on pushes to main, so PRs never publish.
+  # Only on pushes to master, so PRs never publish.
   publish:
     needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -181,7 +181,7 @@ jobs:
   # this commit's SHA. Skips with a notice if the deploy hook secret isn't configured.
   deploy:
     needs: publish
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     environment:
       name: production
