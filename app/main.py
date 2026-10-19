@@ -26,7 +26,7 @@ def health() -> dict[str, str]:
 def report_telemetry(robot_id: str, payload: TelemetryIn) -> Telemetry:
     record = Telemetry(robot_id=robot_id, timestamp=datetime.now(UTC), **payload.model_dump())
     store[robot_id] = record
-    return record
+    return records
 
 
 @app.get("/robots/{robot_id}", response_model=Telemetry)
