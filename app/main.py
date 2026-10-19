@@ -24,7 +24,7 @@ def health() -> dict[str, str]:
     response_model=Telemetry,
 )
 def report_telemetry(robot_id: str, payload: TelemetryIn) -> Telemetry:
-    records = Telemetry(robot_id=robot_id, timestamp=datetime.now(UTC), **payload.model_dump())
+    record = Telemetry(robot_id=robot_id, timestamp=datetime.now(UTC), **payload.model_dump())
     store[robot_id] = record
     return record
 
